@@ -4385,6 +4385,7 @@ function connectTV() {
   if (IS_HTTPS_PAGE) {
     setProgress(5, 'Checking TLS cert + SSAP WSS availability…');
     log('Pre-flight: verifying TV cert is trusted at https://' + ip + ':3001/ …', 'info');
+    const preflightStartedAt = Date.now();
 
     fetch('https://' + ip + ':3001/', { mode: 'no-cors', signal: AbortSignal.timeout(4000) })
       .then(() => {
@@ -4402,8 +4403,13 @@ function connectTV() {
         }
       })
       .catch((certErr) => {
-        log('Pre-flight FAILED: ' + certErr.message, 'err');
-        log('This usually means the TV\'s self-signed cert on :3001 has not been accepted by this browser yet.', 'err');
+        const elapsedMs = Date.now() - preflightStartedAt;
+        log('Pre-flight FAILED after ' + elapsedMs + 'ms: ' + certErr.message, 'err');
+        if (elapsedMs < 1500) {
+          log('Failing this fast is the signature of the browser rejecting the cert outright (TLS handshake refused), not a network timeout.', 'err');
+        } else {
+          log('Taking this long before failing suggests the TV may simply be unreachable at this IP, separate from any cert question.', 'warn');
+        }
         log('Fix: click "Open TV cert page in new tab" above, accept the warning there, then click Connect again.', 'warn');
         document.getElementById('httpsBanner').style.display = 'block';
         document.getElementById('certIpLabel').textContent = ip;
@@ -4442,9 +4448,9 @@ function probeWssUpgrade(ip, port, timeoutMs) {
 // rather than letting them retry the same failing thing indefinitely.
 function diagnoseAlternatePort(ip) {
   log('Options from here:', 'warn');
-  log('  1. Run this app from a plain HTTP context instead of HTTPS (e.g. host it locally, or use the Tauri desktop build) — that allows ws://' + ip + ':3000 directly, no TLS needed.', 'warn');
-  log('  2. Check the TV Settings → General → About / Network for an option enabling secure/TLS SSAP access, if your firmware exposes one.', 'warn');
-  log('  3. Confirm port 3000 is reachable at all (separate from the TLS question) using the Ports tab once you have any working connection method.', 'warn');
+  log('  1. Run a local relay (see lgtv-relay/README.md) — a tiny script that bridges wss://localhost <-> ws://' + ip + ':3000, so this hosted page can reach the TV even though it only supports plain WebSocket. This is the option that keeps working from GitHub Pages.', 'warn');
+  log('  2. Run this app from a plain HTTP context instead of HTTPS (host it locally) or use the Tauri desktop build — both allow ws://' + ip + ':3000 directly, no TLS needed.', 'warn');
+  log('  3. Check the TV Settings → General → About / Network for an option enabling secure/TLS SSAP access, if your firmware exposes one.', 'warn');
   setStatus('error');
   setProgress(0, '');
   document.getElementById('connectBtn').disabled = false;
@@ -4457,6 +4463,16 @@ function actuallyConnectWS(wsUrl) {
 
   manifestIdx = 0;
   if (ws) { try { ws.close(); } catch(e) {} ws = null; }
+
+  // Timing-based diagnosis: a WSS connection that fails almost instantly
+  // (under ~1.5s) is very rarely a real network/reachability problem — TCP
+  // timeouts to a dead host take noticeably longer than that. A near-instant
+  // failure is the signature of the BROWSER rejecting the TLS handshake
+  // outright because the TV's self-signed cert isn't trusted yet. A slower
+  // failure (full timeout) points at the TV being genuinely unreachable —
+  // wrong IP, TV off, or the port just isn't open. This lets us give a much
+  // more specific diagnosis than the generic mixed-content message alone.
+  const connectStartedAt = Date.now();
 
   ws = new ProxyWebSocket(wsUrl);
 
@@ -4476,9 +4492,23 @@ function actuallyConnectWS(wsUrl) {
   };
 
   ws.onerror = function(e) {
-    log('WebSocket error: ' + (e.message||'connection failed'), 'err');
+    const elapsedMs = Date.now() - connectStartedAt;
+    log('WebSocket error: ' + (e.message||'connection failed') + ' (after ' + elapsedMs + 'ms)', 'err');
+
     if (IS_HTTPS_PAGE) {
-      log('If this keeps failing after accepting the cert: TV may not have wss:// (port 3001) enabled, or it is off/unreachable.', 'warn');
+      const likelyCertBlocked = elapsedMs < 1500;
+      if (likelyCertBlocked) {
+        log('Failed almost immediately (' + elapsedMs + 'ms) — this is the signature of the browser rejecting the TV\'s self-signed certificate outright, not a network problem.', 'err');
+        log('Fix: click "Open TV cert page in new tab" above, accept the warning fully (Advanced → Proceed / Accept the Risk), then click Connect again.', 'warn');
+        document.getElementById('httpsBanner').style.display = 'block';
+        const statusEl = document.getElementById('certStatus');
+        if (statusEl) {
+          statusEl.className = 'https-banner-status err';
+          statusEl.textContent = '✗ Connection rejected in ' + elapsedMs + 'ms — certificate likely still not trusted. Accept it via the button above, then retry.';
+        }
+      } else {
+        log('Failed after ' + elapsedMs + 'ms — this is more consistent with the TV being genuinely unreachable (wrong IP, TV off, or port 3001 not open) than a cert problem.', 'warn');
+      }
     } else {
       log('Check: TV must be ON, LG Connect Apps enabled, same network', 'warn');
     }
@@ -4487,9 +4517,14 @@ function actuallyConnectWS(wsUrl) {
   };
 
   ws.onclose = function(e) {
-    log('WebSocket closed code=' + (e.code||'?') + (e.reason ? ' ' + e.reason : ''), 'warn');
+    const elapsedMs = Date.now() - connectStartedAt;
+    log('WebSocket closed code=' + (e.code||'?') + (e.reason ? ' ' + e.reason : '') + ' (after ' + elapsedMs + 'ms)', 'warn');
     if (IS_HTTPS_PAGE && e.code === 1006 && allApps.length === 0) {
-      log('code=1006 immediately after a passed pre-flight check usually means port 3001 itself is closed/unreachable (not a cert problem) — check the TV is on and SSAP secure mode is enabled.', 'warn');
+      if (elapsedMs < 1500) {
+        log('code=1006 after only ' + elapsedMs + 'ms strongly suggests the certificate was not accepted (an instant rejection), even though the earlier upgrade probe passed — browsers can behave inconsistently across repeated WSS attempts to a self-signed host. Re-open the cert page, fully click through the warning, then retry.', 'warn');
+      } else {
+        log('code=1006 after ' + elapsedMs + 'ms (slower failure) suggests port 3001 itself is closed/unreachable rather than a cert issue — check the TV is on and SSAP secure mode is enabled.', 'warn');
+      }
     }
     if (allApps.length === 0) {
       setStatus('');
