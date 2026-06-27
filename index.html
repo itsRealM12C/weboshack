@@ -4372,24 +4372,38 @@ function connectTV() {
   const wsPort  = useTLS ? '3001' : '3000';
   const wsUrl   = wsProto + '://' + ip + ':' + wsPort;
 
-  // On HTTPS pages, run an active pre-flight check that the TV's self-signed
-  // cert on :3001 is actually trusted by this browser BEFORE attempting the
-  // WSS handshake. Skipping a self-signed cert prompt produces an immediate,
-  // unhelpful code=1006 close with no visible warning (the cert-warning UI
-  // only ever appears for top-level navigation, never for a background
-  // WebSocket attempt) — so without this check the failure looks identical
-  // to "TV is off" or "wrong IP", which wastes time misdiagnosing it.
+  // On HTTPS pages, run real pre-flight checks BEFORE attempting the actual
+  // SSAP handshake, because a generic HTTPS fetch success does NOT prove the
+  // TV's SSAP service is actually listening for WebSocket upgrades on 3001 —
+  // it only proves *something* answers HTTPS there. Many LG webOS firmwares
+  // either don't expose SSAP over WSS on 3001 at all, or only do so under
+  // conditions (TV mode pairing, certain firmware versions) that don't apply
+  // here. So we test the actual WebSocket upgrade directly, with a short
+  // timeout, and separately check whether port 3000 (plain SSAP, no TLS) is
+  // even reachable — that tells us whether the problem is "wrong port" vs
+  // "TV unreachable entirely".
   if (IS_HTTPS_PAGE) {
-    setProgress(5, 'Checking TLS certificate trust…');
+    setProgress(5, 'Checking TLS cert + SSAP WSS availability…');
     log('Pre-flight: verifying TV cert is trusted at https://' + ip + ':3001/ …', 'info');
+
     fetch('https://' + ip + ':3001/', { mode: 'no-cors', signal: AbortSignal.timeout(4000) })
       .then(() => {
-        log('Pre-flight OK — cert appears trusted, opening WebSocket…', 'ok');
-        actuallyConnectWS(wsUrl);
+        log('Cert check OK — now testing actual SSAP WebSocket upgrade on :3001…', 'info');
+        return probeWssUpgrade(ip, 3001, 4000);
+      })
+      .then((upgradeOk) => {
+        if (upgradeOk) {
+          log('SSAP WSS upgrade responded — opening real connection…', 'ok');
+          actuallyConnectWS(wsUrl);
+        } else {
+          log('Cert is trusted, but no SSAP WebSocket service responded on :3001 within the timeout.', 'err');
+          log('This usually means this TV/firmware does not expose SSAP over WSS on port 3001 at all — only plain ws://3000, which an HTTPS page cannot use due to mixed-content blocking.', 'warn');
+          diagnoseAlternatePort(ip);
+        }
       })
       .catch((certErr) => {
         log('Pre-flight FAILED: ' + certErr.message, 'err');
-        log('This almost always means the TV\'s self-signed cert on :3001 has not been accepted by this browser yet.', 'err');
+        log('This usually means the TV\'s self-signed cert on :3001 has not been accepted by this browser yet.', 'err');
         log('Fix: click "Open TV cert page in new tab" above, accept the warning there, then click Connect again.', 'warn');
         document.getElementById('httpsBanner').style.display = 'block';
         document.getElementById('certIpLabel').textContent = ip;
@@ -4404,6 +4418,36 @@ function connectTV() {
   }
 
   actuallyConnectWS(wsUrl);
+}
+
+// Probe whether a WSS endpoint actually completes the WebSocket upgrade
+// handshake (vs. just answering plain HTTPS). resolve(true) on 'open',
+// resolve(false) on error/timeout/close-before-open.
+function probeWssUpgrade(ip, port, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (ok) => { if (!settled) { settled = true; resolve(ok); } };
+    let testWs;
+    try {
+      testWs = new WebSocket('wss://' + ip + ':' + port);
+    } catch(e) { settle(false); return; }
+    const timer = setTimeout(() => { try { testWs.close(); } catch(e){} settle(false); }, timeoutMs);
+    testWs.onopen = () => { clearTimeout(timer); try { testWs.close(); } catch(e){} settle(true); };
+    testWs.onerror = () => { clearTimeout(timer); settle(false); };
+    testWs.onclose = () => { clearTimeout(timer); settle(false); };
+  });
+}
+
+// When WSS isn't usable, tell the user clearly what their real options are —
+// rather than letting them retry the same failing thing indefinitely.
+function diagnoseAlternatePort(ip) {
+  log('Options from here:', 'warn');
+  log('  1. Run this app from a plain HTTP context instead of HTTPS (e.g. host it locally, or use the Tauri desktop build) — that allows ws://' + ip + ':3000 directly, no TLS needed.', 'warn');
+  log('  2. Check the TV Settings → General → About / Network for an option enabling secure/TLS SSAP access, if your firmware exposes one.', 'warn');
+  log('  3. Confirm port 3000 is reachable at all (separate from the TLS question) using the Ports tab once you have any working connection method.', 'warn');
+  setStatus('error');
+  setProgress(0, '');
+  document.getElementById('connectBtn').disabled = false;
 }
 
 function actuallyConnectWS(wsUrl) {
