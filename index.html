@@ -4371,6 +4371,42 @@ function connectTV() {
   const wsProto = useTLS ? 'wss' : 'ws';
   const wsPort  = useTLS ? '3001' : '3000';
   const wsUrl   = wsProto + '://' + ip + ':' + wsPort;
+
+  // On HTTPS pages, run an active pre-flight check that the TV's self-signed
+  // cert on :3001 is actually trusted by this browser BEFORE attempting the
+  // WSS handshake. Skipping a self-signed cert prompt produces an immediate,
+  // unhelpful code=1006 close with no visible warning (the cert-warning UI
+  // only ever appears for top-level navigation, never for a background
+  // WebSocket attempt) — so without this check the failure looks identical
+  // to "TV is off" or "wrong IP", which wastes time misdiagnosing it.
+  if (IS_HTTPS_PAGE) {
+    setProgress(5, 'Checking TLS certificate trust…');
+    log('Pre-flight: verifying TV cert is trusted at https://' + ip + ':3001/ …', 'info');
+    fetch('https://' + ip + ':3001/', { mode: 'no-cors', signal: AbortSignal.timeout(4000) })
+      .then(() => {
+        log('Pre-flight OK — cert appears trusted, opening WebSocket…', 'ok');
+        actuallyConnectWS(wsUrl);
+      })
+      .catch((certErr) => {
+        log('Pre-flight FAILED: ' + certErr.message, 'err');
+        log('This almost always means the TV\'s self-signed cert on :3001 has not been accepted by this browser yet.', 'err');
+        log('Fix: click "Open TV cert page in new tab" above, accept the warning there, then click Connect again.', 'warn');
+        document.getElementById('httpsBanner').style.display = 'block';
+        document.getElementById('certIpLabel').textContent = ip;
+        const statusEl = document.getElementById('certStatus');
+        statusEl.className = 'https-banner-status err';
+        statusEl.textContent = '✗ Certificate not yet trusted for ' + ip + ' — accept it via the button above, then retry.';
+        setStatus('error');
+        setProgress(0, '');
+        document.getElementById('connectBtn').disabled = false;
+      });
+    return;
+  }
+
+  actuallyConnectWS(wsUrl);
+}
+
+function actuallyConnectWS(wsUrl) {
   log('Connecting to ' + wsUrl + ' via null-origin iframe proxy...', 'info');
   if (IS_HTTPS_PAGE) log('Page is HTTPS — forcing WSS (mixed-content policy)', 'info');
   setProgress(5, 'Opening WebSocket...');
@@ -4397,13 +4433,20 @@ function connectTV() {
 
   ws.onerror = function(e) {
     log('WebSocket error: ' + (e.message||'connection failed'), 'err');
-    log('Check: TV must be ON, LG Connect Apps enabled, same network', 'warn');
+    if (IS_HTTPS_PAGE) {
+      log('If this keeps failing after accepting the cert: TV may not have wss:// (port 3001) enabled, or it is off/unreachable.', 'warn');
+    } else {
+      log('Check: TV must be ON, LG Connect Apps enabled, same network', 'warn');
+    }
     setStatus('error');
     document.getElementById('connectBtn').disabled = false;
   };
 
   ws.onclose = function(e) {
     log('WebSocket closed code=' + (e.code||'?') + (e.reason ? ' ' + e.reason : ''), 'warn');
+    if (IS_HTTPS_PAGE && e.code === 1006 && allApps.length === 0) {
+      log('code=1006 immediately after a passed pre-flight check usually means port 3001 itself is closed/unreachable (not a cert problem) — check the TV is on and SSAP secure mode is enabled.', 'warn');
+    }
     if (allApps.length === 0) {
       setStatus('');
       document.getElementById('connectBtn').disabled = false;
